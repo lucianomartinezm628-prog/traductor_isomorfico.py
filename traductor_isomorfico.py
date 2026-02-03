@@ -63,7 +63,7 @@ class EntradaGlosario:
     token_tgt: str
     categoria: Categoria
     status: Status
-    etimologia_ia: str = "" # Nueva propiedad para explicación IA
+    etimologia_ia: str = "" 
 
 # ==============================================================================
 # SISTEMA CENTRAL (CON CEREBRO IA)
@@ -77,10 +77,8 @@ class SistemaTraduccion:
         self.modo_salida = "BORRADOR"
         self.api_key = ""
 
-    # --- P8 & P10: PROCESAMIENTO ---
     def _detectar_categoria(self, token: str) -> Categoria:
         if re.match(r"[^\w\s]", token): return Categoria.PUNTUACION
-        # Lista básica de partículas comunes en español/inglés/árabe transliterado
         particulas = {"el", "la", "de", "en", "y", "que", "a", "al", "wa", "fi", "min", "bi"}
         if token.lower() in particulas: return Categoria.PARTICULA
         return Categoria.NUCLEO
@@ -103,25 +101,21 @@ class SistemaTraduccion:
             self.mtx_s.append(Slot(id=f"S_{i}", pos_index=i, token_src=token, categoria=cat))
             self.mtx_t.append(Slot(id=f"T_{i}", pos_index=i, token_src=token))
 
-    # --- P6: IA GENERATIVA (GEMINI) ---
     def consultar_ia_glosario(self):
-        """Envía los tokens PENDIENTES a Gemini para traducción isomorfica"""
         if not self.api_key:
             return False, "Falta API Key"
 
-        # 1. Filtrar qué falta traducir (solo Núcleos pendientes)
         pendientes = [k for k, v in self.glosario.items() 
                       if v.status == Status.PENDIENTE and v.categoria == Categoria.NUCLEO]
         
         if not pendientes:
             return False, "No hay núcleos pendientes."
 
-        # 2. Configurar IA
         try:
             genai.configure(api_key=self.api_key)
-            model = genai.GenerativeModel('gemini-pro')
+            # SE ACTUALIZA A GEMINI-1.5-FLASH PARA EVITAR ERROR 404
+            model = genai.GenerativeModel('gemini-1.5-flash')
             
-            # 3. Prompt de Ingeniería (Protocolo 1)
             prompt = f"""
             Actúa como un traductor etimológico estricto (Protocolo Isomórfico).
             Tengo una lista de tokens fuente. Necesito su raíz/traducción literal en español.
@@ -137,12 +131,9 @@ class SistemaTraduccion:
             
             with st.spinner(f"Consultando raíces etimológicas para {len(pendientes)} tokens..."):
                 response = model.generate_content(prompt)
-                
-                # Limpieza de respuesta para asegurar JSON
                 texto_resp = response.text.replace("```json", "").replace("```", "")
                 diccionario_ia = json.loads(texto_resp)
                 
-                # 4. Aplicar al Glosario
                 count = 0
                 for k, v in diccionario_ia.items():
                     if k in self.glosario:
@@ -156,7 +147,6 @@ class SistemaTraduccion:
         except Exception as e:
             return False, f"Error IA: {str(e)}"
 
-    # --- P3: CORE ---
     def ejecutar_core_p3(self):
         for i, slot_s in enumerate(self.mtx_s):
             slot_t = self.mtx_t[i]
@@ -176,7 +166,6 @@ class SistemaTraduccion:
                     slot_t.token_tgt = ""
                     slot_t.status = Status.PENDIENTE
 
-    # --- P7 & P8.A ---
     def crear_locucion(self, start, end, texto):
         if not (0 <= start <= end < len(self.mtx_s)): return False, "Rango inválido"
         tokens = [self.mtx_s[i].token_src for i in range(start, end+1)]
@@ -199,12 +188,6 @@ class SistemaTraduccion:
             if txt not in ["("]: buffer.append(" ")
         return "".join(buffer).strip()
 
-    # --- P7 Cirugía ---
-    def inyectar(self, i, t, pos):
-        if 0<=i<len(self.mtx_t):
-            l = self.mtx_t[i].inyecciones_previas if pos=="PRE" else self.mtx_t[i].inyecciones_posteriores
-            l.append(t)
-
 # ==============================================================================
 # UI
 # ==============================================================================
@@ -216,7 +199,7 @@ def main():
     with st.sidebar:
         st.title("⚙️ Configuración")
         st.markdown("### 🧠 Cerebro IA (Gemini)")
-        api_key = st.text_input("Google API Key", type="password", help="Pega tu clave de Google AI Studio aquí")
+        api_key = st.text_input("Google API Key", type="password")
         if api_key: sys.api_key = api_key
         
         sys.modo_salida = st.radio("Modo Visual", ["BORRADOR", "FINAL"])
@@ -235,7 +218,6 @@ def main():
         tabs = st.tabs(["Matriz", "Glosario (IA)", "Salida"])
         
         with tabs[0]:
-            # Render HTML
             html = []
             for i, s in enumerate(sys.mtx_t):
                 color = "#d4edda" if s.status == Status.ASIGNADO else "#eee"
@@ -262,7 +244,6 @@ def main():
                     st.rerun()
                 else: st.error(msg)
             
-            # Editor Manual
             data = [{"Token": k, "Traducción": v.token_tgt, "Status": v.status.value} 
                     for k,v in sys.glosario.items() if v.categoria == Categoria.NUCLEO]
             if data:
