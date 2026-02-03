@@ -1,324 +1,430 @@
 import streamlit as st
-import google.generativeai as genai
-import json
 import pandas as pd
-import time
-from io import BytesIO
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+from enum import Enum
+import re
+import json
 
 # ==============================================================================
-# 1. CONFIGURACIÓN INICIAL (SETUP)
-# ==============================================================================
-st.set_page_config(page_title="Sistema Isomórfico Full 2.0", page_icon="🏛️", layout="wide")
-
-# Inicialización de Estado (Memoria de Sesión)
-if "glossary" not in st.session_state:
-    st.session_state.glossary = {} # P8: Glosario (Token -> Traducción)
-if "glossary_meta" not in st.session_state:
-    st.session_state.glossary_meta = {} # Metadatos (Categoría, Margen, Etiqueta)
-if "user_rules" not in st.session_state:
-    st.session_state.user_rules = [] # P0.3: Reglas de Usuario
-if "stage" not in st.session_state:
-    st.session_state.stage = "INPUT"
-if "current_text" not in st.session_state:
-    st.session_state.current_text = ""
-if "pending_decisions" not in st.session_state:
-    st.session_state.pending_decisions = []
-if "translation_result" not in st.session_state:
-    st.session_state.translation_result = ""
-
-# ==============================================================================
-# 2. DEFINICIÓN DE PROTOCOLOS (TEXTOS CONSTITUCIONALES P1-P10)
-# ==============================================================================
-# Estos textos se inyectarán en la IA para forzar el comportamiento (P2)
-
-PROTOCOL_CONSTITUTION = """
-ERES EL MOTOR DEL SISTEMA DE TRADUCCIÓN ISOMÓRFICA V2.0.
-TU ÚNICO OBJETIVO ES OBEDECER LOS SIGUIENTES PROTOCOLOS SIN DESVIACIÓN:
-
-PROTOCOLO 1 (DEFINICIONES):
-- Input: Árabe Clásico. Output: Español.
-- Literalidad Máxima e Isomorfismo Posicional.
-- JERARQUÍA: ESTILO > IDENTIDAD > COHESIÓN.
-
-PROTOCOLO 2 (CONSTITUCIÓN - INVIOLABLE):
-- PROHIBIDO: Crear coherencia sin permiso, reordenar tokens, eliminar tokens, usar sinónimos para núcleos.
-- OBLIGATORIO: Mapeo 1:1 en núcleos. Si es agramatical pero isomórfico, SE ACEPTA.
-- La máquina NO lucha contra los protocolos.
-
-PROTOCOLO 4 (NÚCLEOS):
-- Invariables. Una traducción por token, siempre.
-- JERARQUÍA ETIMOLÓGICA: Fuente > Latina > Griega > Árabe > Técnica.
-
-PROTOCOLO 7 (REPARACIÓN):
-- Solo inyecciones [...] permitidas para soporte mínimo (WHITELIST: hecho, cosa, algo, que).
-- Nulidad {...} solo como último recurso.
-
-PROTOCOLO 9 (FORMACIÓN):
-- Si no hay equivalente: Transliteración (DIN 31635) o Neologismo (Raíz + Sufijo).
-- Locuciones: ETYM(A)-ETYM(B)-... (con guiones).
-"""
-
-# ==============================================================================
-# 3. FUNCIONES LÓGICAS (PYTHON - EL CUERPO)
+# PROTOCOLO 1 & 2: DEFINICIONES Y CONSTITUCIÓN
 # ==============================================================================
 
-def configure_genai(api_key):
-    if not api_key:
-        return None
-    genai.configure(api_key=api_key, transport='rest')
-    # Usamos el nombre técnico exacto de la versión Pro estable
-    return genai.GenerativeModel('gemini-1.5-pro')
+class Categoria(Enum):
+    NUCLEO = "NUCLEO"       # Sust, Adj, Adv, Verb
+    PARTICULA = "PARTICULA" # Prep, Conj, Pron
+    LOCUCION = "LOCUCION"   # Unidad compleja A-B-C
+    PUNTUACION = "PUNTUACION"
 
+class Status(Enum):
+    PENDIENTE = "PENDIENTE"
+    ASIGNADO = "ASIGNADO"
+    BLOQUEADO = "BLOQUEADO" # Parte de una locución (ABSORBIDO)
+    NULO = "NULO"           # {...} (Protocolo 7)
 
+class Origen(Enum):
+    FUENTE = "FUENTE"
+    INYECCION = "INYECCION" # [...] P7
+    POLIVALENCIA = "POLIVALENCIA" # P5
 
-def p10_a_cleaning(text):
-    """P10.A: Limpieza y Normalización"""
-    # Aquí se podrían añadir RegEx para limpiar números de página, etc.
-    cleaned = text.strip()
-    return cleaned
+class Margen(Enum):
+    IDIOM = 6      # Máximo
+    COLLISION = 5
+    NO_ROOT = 4
+    TRANSLIT = 3
+    ALT_1_1 = 2
+    DIRECTO = 1    # Mínimo
 
-def p8_update_glossary(decisions):
-    """P8.B: Registro en Glosario"""
-    for token, data in decisions.items():
-        st.session_state.glossary[token] = data['traduccion']
-        st.session_state.glossary_meta[token] = {
-            "categoria": data['categoria'],
-            "origen": "USUARIO (P0)"
-        }
-
-def export_data():
-    """P11.D: Exportación"""
-    glossary_data = []
-    for token, trad in st.session_state.glossary.items():
-        meta = st.session_state.glossary_meta.get(token, {})
-        glossary_data.append({
-            "Token Fuente": token,
-            "Traducción Target": trad,
-            "Categoría": meta.get("categoria", "-"),
-            "Origen": meta.get("origen", "-")
-        })
-    return pd.DataFrame(glossary_data)
+class TipoConsulta(Enum):
+    C1_CONFLICTO = "C1"
+    C2_COLLISION = "C2"
+    C3_LOCUCION = "C3"
+    C4_SINONIMIA = "C4"
+    C5_NO_REGISTRADO = "C5"
 
 # ==============================================================================
-# 4. FUNCIONES DE IA (GEMINI - EL CEREBRO)
+# ESTRUCTURAS DE DATOS (P1.B, P8, P0)
 # ==============================================================================
 
-def execute_p8_analysis(text, model, user_rules):
-    """Ejecuta P8.A (Detección de dudas) usando la IA"""
-    existing = list(st.session_state.glossary.keys())
-    rules_text = "\n".join(user_rules)
+@dataclass
+class Slot:
+    """Representa un token en la Matriz Target (Mtx_T)"""
+    id: str
+    pos_index: int
+    token_src: str
+    token_tgt: str = ""
+    categoria: Categoria = Categoria.NUCLEO
+    status: Status = Status.PENDIENTE
+    origen: Origen = Origen.FUENTE
     
-    prompt = f"""
-    {PROTOCOL_CONSTITUTION}
-    
-    CONFIGURACIÓN DE USUARIO (P0.3):
-    {rules_text}
-    
-    TAREA (P8.A - ANÁLISIS LÉXICO):
-    1. Analiza el siguiente texto árabe.
-    2. Identifica NÚCLEOS nuevos, POSIBLES LOCUCIONES (P9.D) o TÉRMINOS AMBIGUOS (C6).
-    3. IGNORA los términos que ya están en el GLOSARIO EXISTENTE: {existing}
-    
-    FORMATO DE SALIDA (JSON PURO, sin markdown):
-    [
-      {{
-        "token_src": "palabra_arabe",
-        "type": "C2_COLLISION" o "C3_IDIOM" o "C6_DUDOSO" o "NUEVO",
-        "context": "breve explicación del contexto",
-        "options": ["Opción A", "Opción B", "Opción C"],
-        "recommendation": "Opción A"
-      }}
-    ]
-    
-    TEXTO FUENTE:
-    {text}
-    """
-    try:
-        response = model.generate_content(prompt)
-        clean_json = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_json)
-    except Exception as e:
-        st.error(f"Error P8.A: {e}")
-        return []
+    # Protocolo 7: Soporte Gramatical (Cirugía)
+    inyecciones_previas: List[str] = field(default_factory=list)
+    inyecciones_posteriores: List[str] = field(default_factory=list)
 
-def execute_p3_translation(text, model, user_rules):
-    """Ejecuta P3-P7 (Traducción) usando la IA con Glosario Inyectado"""
-    glossary_json = json.dumps(st.session_state.glossary, ensure_ascii=False)
-    rules_text = "\n".join(user_rules)
-    
-    prompt = f"""
-    {PROTOCOL_CONSTITUTION}
-    
-    CONFIGURACIÓN DE USUARIO (P0.3):
-    {rules_text}
-    
-    GLOSARIO ACTIVO (P8 - INMUTABLE):
-    Debes usar ESTAS traducciones exactas para estos tokens. PROHIBIDO SINÓNIMOS.
-    {glossary_json}
-    
-    TAREA (P3 CORE + P7 REPARACIÓN):
-    Traduce el texto aplicando isomorfismo y las reglas P10.B (Formato).
-    
-    TEXTO FUENTE:
-    {text}
-    """
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Error Crítico P3: {e}"
-
-# ==============================================================================
-# 5. INTERFAZ DE USUARIO (STREAMLIT - P0 & P11)
-# ==============================================================================
-
-# --- BARRA LATERAL (P11) ---
-with st.sidebar:
-    st.title("⚙️ P11: COMANDOS")
-    
-    # API Key
-    api_key = st.text_input("Gemini API Key", type="password")
-    model = configure_genai(api_key)
-    
-    st.divider()
-    
-    # Gestión de Glosario
-    st.subheader("📚 Glosario (P8)")
-    df = export_data()
-    st.dataframe(df, hide_index=True, use_container_width=True)
-    
-    # Exportar (P11.D)
-    if not df.empty:
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("⬇️ Exportar CSV", csv, "glosario_isomorfico.csv", "text/csv")
+    def render(self, mode="BORRADOR"):
+        """Renderizado P10.B"""
+        # 1. Nulidad
+        if self.status == Status.NULO:
+            return f"{{{self.token_src}}}"
         
-        json_bytes = df.to_json(orient="records", force_ascii=False).encode('utf-8')
-        st.download_button("⬇️ Exportar JSON", json_bytes, "glosario_isomorfico.json", "application/json")
+        # 2. Bloqueo (Locuciones)
+        if self.status == Status.BLOQUEADO:
+            # Si tiene texto y está bloqueado, es la cabecera de la locución.
+            # Si no tiene texto y está bloqueado, está absorbido.
+            if not self.token_tgt:
+                return "" 
+
+        # 3. Contenido
+        nucleo = self.token_tgt if self.token_tgt else f"[{self.token_src}?]"
+        if mode == "BORRADOR" and self.status == Status.PENDIENTE:
+            nucleo = f"___{nucleo}___"
+
+        # 4. Ensamblaje P7
+        # Formato: [iny] [iny] NUCLEO [iny]
+        prefix = "".join([f"[{x}] " for x in self.inyecciones_previas])
+        suffix = "".join([f" [{x}]" for x in self.inyecciones_posteriores])
+        
+        return f"{prefix}{nucleo}{suffix}"
+
+@dataclass
+class EntradaGlosario:
+    """Entrada única del Glosario P8"""
+    token_src: str
+    token_tgt: str
+    categoria: Categoria
+    status: Status
+    margen: Margen
+    bloqueado: bool = False # Para componentes de locución
+
+@dataclass
+class Consulta:
+    """Objeto de Decisión P0"""
+    id: str
+    tipo: TipoConsulta
+    contexto: str
+    opciones: List[str]
+    recomendacion: str
+    resuelta: bool = False
+    respuesta_usuario: str = ""
+
+# ==============================================================================
+# SISTEMA CENTRAL (LÓGICA P3, P8, P7)
+# ==============================================================================
+
+class SistemaTraduccion:
+    def __init__(self):
+        self.mtx_s: List[Slot] = [] 
+        self.mtx_t: List[Slot] = [] 
+        self.glosario: Dict[str, EntradaGlosario] = {}
+        self.consultas_pendientes: List[Consulta] = []
+        self.modo_salida = "BORRADOR"
+
+    # --- P8.A & P10: PROCESAMIENTO INICIAL ---
     
-    # Importar
-    uploaded_file = st.file_uploader("⬆️ Importar Glosario (JSON/CSV)")
-    if uploaded_file:
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                loaded_df = pd.read_csv(uploaded_file)
+    def _detectar_categoria(self, token: str) -> Categoria:
+        if re.match(r"[^\w\s]", token): return Categoria.PUNTUACION
+        if token.lower() in {"el", "la", "de", "en", "y", "que", "a"}: return Categoria.PARTICULA
+        return Categoria.NUCLEO
+
+    def registrar_token(self, token_src, categoria, margen=Margen.DIRECTO):
+        if token_src not in self.glosario:
+            self.glosario[token_src] = EntradaGlosario(
+                token_src=token_src, token_tgt="", categoria=categoria,
+                status=Status.PENDIENTE, margen=margen
+            )
+
+    def procesar_texto_input(self, texto_crudo: str):
+        # P10.A Limpieza
+        texto_limpio = texto_crudo.replace("\r", "")
+        tokens_raw = re.findall(r"(\w+|[^\w\s])", texto_limpio)
+        
+        self.mtx_s = []
+        self.mtx_t = []
+
+        # P8.A Tokenización
+        for i, token in enumerate(tokens_raw):
+            cat = self._detectar_categoria(token)
+            token_key = token.lower() if cat != Categoria.PUNTUACION else token
+            
+            self.registrar_token(token_key, cat)
+            
+            # Crear Slots
+            self.mtx_s.append(Slot(id=f"S_{i}", pos_index=i, token_src=token, categoria=cat))
+            self.mtx_t.append(Slot(id=f"T_{i}", pos_index=i, token_src=token))
+
+    # --- P8.A AVANZADO: LOCUCIONES ---
+
+    def crear_locucion(self, start_index: int, end_index: int, traduccion_locucion: str):
+        if not (0 <= start_index < len(self.mtx_s)) or not (0 <= end_index < len(self.mtx_s)):
+            return False, "Índices inválidos."
+        if start_index > end_index:
+            return False, "Inicio > Fin."
+
+        # Key compuesta
+        tokens_src = [self.mtx_s[i].token_src for i in range(start_index, end_index + 1)]
+        key_locucion = " ".join(tokens_src).lower()
+
+        # Registrar locución
+        self.glosario[key_locucion] = EntradaGlosario(
+            token_src=key_locucion, token_tgt=traduccion_locucion,
+            categoria=Categoria.LOCUCION, status=Status.ASIGNADO, margen=Margen.IDIOM
+        )
+
+        # Aplicar Bloqueo en Matriz Target
+        for i in range(start_index, end_index + 1):
+            slot = self.mtx_t[i]
+            slot.status = Status.BLOQUEADO
+            if i == start_index:
+                slot.token_tgt = traduccion_locucion
+                slot.categoria = Categoria.LOCUCION
             else:
-                loaded_df = pd.read_json(uploaded_file)
-            
-            # Cargar en sesión
-            for _, row in loaded_df.iterrows():
-                token = row.get("Token Fuente") or row.get("token_src")
-                trad = row.get("Traducción Target") or row.get("token_tgt")
-                if token and trad:
-                    st.session_state.glossary[token] = trad
-                    st.session_state.glossary_meta[token] = {"origen": "IMPORTADO"}
-            st.success("Glosario importado.")
-        except Exception as e:
-            st.error("Error al importar.")
+                slot.token_tgt = "" # Absorbido
+        
+        return True, f"Locución '{key_locucion}' creada."
 
-    st.divider()
-    
-    # Reglas de Usuario (P0.3)
-    st.subheader("📝 Reglas (P0.3)")
-    new_rule = st.text_input("Añadir Regla (ej: 'Siempre traduce X como Y')")
-    if st.button("Añadir Regla"):
-        if new_rule:
-            st.session_state.user_rules.append(new_rule)
-            st.success("Regla registrada.")
-    
-    if st.session_state.user_rules:
-        st.write("Reglas Activas:")
-        for i, rule in enumerate(st.session_state.user_rules):
-            st.caption(f"{i+1}. {rule}")
-        if st.button("Borrar todas las reglas"):
-            st.session_state.user_rules = []
+    # --- P3: CORE DE TRADUCCIÓN ---
+
+    def ejecutar_core_p3(self):
+        for i, slot_s in enumerate(self.mtx_s):
+            slot_t = self.mtx_t[i]
+            
+            # Respetar bloqueos de locuciones ya establecidas manualmente
+            if slot_t.status == Status.BLOQUEADO and slot_t.categoria == Categoria.LOCUCION:
+                continue
+            if slot_t.status == Status.BLOQUEADO and not slot_t.token_tgt:
+                continue
+
+            token_key = slot_s.token_src.lower()
+            entrada = self.glosario.get(token_key)
+            if not entrada and slot_s.categoria == Categoria.PUNTUACION:
+                 entrada = self.glosario.get(slot_s.token_src)
+
+            if entrada and entrada.token_tgt:
+                slot_t.token_tgt = entrada.token_tgt
+                slot_t.status = Status.ASIGNADO
+                slot_t.categoria = entrada.categoria
+            else:
+                if slot_t.status != Status.NULO: # Respetar anulaciones P7
+                    slot_t.token_tgt = ""
+                    slot_t.status = Status.PENDIENTE
+
+    # --- P7: REPARACIÓN SINTÁCTICA ---
+
+    def inyectar_token(self, index: int, texto: str, posicion="PRE"):
+        if 0 <= index < len(self.mtx_t):
+            slot = self.mtx_t[index]
+            if posicion == "PRE": slot.inyecciones_previas.append(texto)
+            else: slot.inyecciones_posteriores.append(texto)
+            return True, "Inyección exitosa."
+        return False, "Índice error."
+
+    def alternar_nulidad(self, index: int):
+        if 0 <= index < len(self.mtx_t):
+            slot = self.mtx_t[index]
+            if slot.status == Status.NULO:
+                slot.status = Status.ASIGNADO if slot.token_tgt else Status.PENDIENTE
+                return True, "Restaurado."
+            else:
+                slot.status = Status.NULO
+                return True, "Anulado."
+        return False, "Error."
+        
+    def limpiar_inyecciones(self, index: int):
+        if 0 <= index < len(self.mtx_t):
+            self.mtx_t[index].inyecciones_previas = []
+            self.mtx_t[index].inyecciones_posteriores = []
+
+    # --- P10: RENDERIZADO FINAL ---
+
+    def renderizar_texto_final(self):
+        buffer = []
+        for slot in self.mtx_t:
+            texto = slot.render(self.modo_salida)
+            if not texto: continue
+
+            # Lógica simple de puntuación (sin espacios antes de , . ; )
+            is_punct = slot.categoria == Categoria.PUNTUACION or texto.strip() in [",", ".", ";", ":"]
+            
+            if is_punct and buffer and buffer[-1] == " ":
+                buffer.pop()
+            
+            buffer.append(texto)
+            if texto not in ["(", "¿", "¡"]:
+                buffer.append(" ")
+        return "".join(buffer).strip()
+
+    # --- P0: CONSULTAS ---
+    def resolver_consulta(self, cid: str):
+        # Simplificado para demo: solo marca como resuelta
+        self.consultas_pendientes = [c for c in self.consultas_pendientes if c.id != cid]
+
+# ==============================================================================
+# INTERFAZ DE USUARIO (STREAMLIT)
+# ==============================================================================
+
+def init_state():
+    if 'sistema' not in st.session_state:
+        st.session_state.sistema = SistemaTraduccion()
+    if 'fase' not in st.session_state:
+        st.session_state.fase = "INPUT"
+    if 'input_text' not in st.session_state:
+        st.session_state.input_text = ""
+
+def main():
+    st.set_page_config(layout="wide", page_title="SysTrad Isomórfica v2.0")
+    init_state()
+    sistema = st.session_state.sistema
+
+    # --- SIDEBAR P11 ---
+    with st.sidebar:
+        st.title("Protocolos Activos")
+        st.code("P2: Constitución\nP3: Isomorfismo\nP8: Glosario\nP7: Reparación")
+        
+        sistema.modo_salida = st.radio("Modo Visualización", ["BORRADOR", "FINAL"])
+        
+        st.divider()
+        st.metric("Glosario Total", len(sistema.glosario))
+        st.metric("Consultas", len(sistema.consultas_pendientes))
+        
+        if st.button("REINICIAR SISTEMA"):
+            st.session_state.clear()
             st.rerun()
 
-    st.divider()
-    if st.button("⚠️ REINICIAR SISTEMA (P11.C)"):
-        st.session_state.glossary = {}
-        st.session_state.user_rules = []
-        st.session_state.stage = "INPUT"
-        st.rerun()
+    st.title("Sistema de Traducción Isomórfica v2.0")
 
-# --- ÁREA PRINCIPAL ---
-st.title("🏛️ Sistema de Traducción Isomórfica Full 2.0")
+    # --- ÁREA PRINCIPAL ---
+    col_izq, col_der = st.columns([1, 1])
 
-if not api_key:
-    st.warning("🔴 Por favor, ingresa tu API Key en la barra lateral para activar el sistema.")
-else:
-    # FASE 1: INPUT
-    if st.session_state.stage == "INPUT":
-        st.markdown("### 1. Input (P10.A)")
-        text_in = st.text_area("Texto Fuente (Árabe):", height=150, value=st.session_state.current_text)
-        
-        if st.button("Analizar Léxico (P8.A) ➡️"):
-            st.session_state.current_text = p10_a_cleaning(text_in)
-            with st.spinner("Ejecutando P8.A..."):
-                dudas = execute_p8_analysis(st.session_state.current_text, model, st.session_state.user_rules)
-                if dudas:
-                    st.session_state.pending_decisions = dudas
-                    st.session_state.stage = "DECISION"
-                else:
-                    st.session_state.stage = "TRANSLATION"
-            st.rerun()
-
-    # FASE 2: DECISIÓN (P0)
-    elif st.session_state.stage == "DECISION":
-        st.markdown("### 2. Consultas y Decisiones (P0)")
-        st.info("El sistema requiere tu autoridad para los siguientes tokens nuevos o conflictivos.")
-        
-        with st.form("form_decisiones"):
-            results = {}
-            for i, item in enumerate(st.session_state.pending_decisions):
-                col_a, col_b = st.columns([1, 2])
-                with col_a:
-                    st.markdown(f"**Token:** `{item['token_src']}`")
-                    st.caption(f"Tipo: {item.get('type', 'NUEVO')}")
-                with col_b:
-                    opts = item['options'] + ["MANUAL"]
-                    sel = st.radio(f"Opción para '{item['token_src']}'", opts, key=f"d_{i}")
-                    
-                    val_final = sel
-                    if sel == "MANUAL":
-                        val_final = st.text_input(f"Traducción manual para {item['token_src']}", key=f"m_{i}")
-                    
-                    # Guardamos temporalmente
-                    results[item['token_src']] = {
-                        "traduccion": val_final,
-                        "categoria": item.get('type', 'GENERAL')
-                    }
-                st.markdown("---")
-            
-            if st.form_submit_button("Sellar Glosario y Traducir (P3) ➡️"):
-                p8_update_glossary(results)
-                st.session_state.stage = "TRANSLATION"
-                st.rerun()
-
-    # FASE 3: TRADUCCIÓN (P3-P7)
-    elif st.session_state.stage == "TRANSLATION":
-        st.markdown("### 3. Resultado Isomórfico (P10.B)")
-        
-        if not st.session_state.translation_result:
-            with st.spinner("Aplicando P3 (Core) + P7 (Reparación) + Glosario Inmutable..."):
-                st.session_state.translation_result = execute_p3_translation(
-                    st.session_state.current_text, 
-                    model, 
-                    st.session_state.user_rules
-                )
+    # Columna Izquierda: Input y Control
+    with col_izq:
+        st.subheader("1. Texto Fuente")
+        txt_in = st.text_area("Ingrese texto aquí:", height=200, key="txt_in_widget")
         
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**Fuente (Árabe)**")
-            st.code(st.session_state.current_text, language="text")
+            if st.button("PROCESAR (P10 -> P8)", use_container_width=True):
+                st.session_state.input_text = txt_in
+                sistema.procesar_texto_input(txt_in)
+                st.session_state.fase = "TRABAJO"
+                st.rerun()
         with c2:
-            st.markdown("**Target (Español Isomórfico)**")
-            st.text_area("Salida", st.session_state.translation_result, height=300)
+            if st.button("Cargar Ejemplo", use_container_width=True):
+                st.session_state.txt_in_widget = "Kitab al-ilm wal-ma'rifa." # Ejemplo simple
+                st.rerun()
+
+    # Columna Derecha: Trabajo
+    with col_der:
+        if st.session_state.fase == "INPUT":
+            st.info("Esperando carga de texto...")
         
-        st.success("Proceso completado bajo protocolo.")
-        
-        if st.button("⬅️ Traducir nuevo fragmento (Conservar Glosario)"):
-            st.session_state.stage = "INPUT"
-            st.session_state.current_text = ""
-            st.session_state.translation_result = ""
-            st.session_state.pending_decisions = []
-            st.rerun()
+        else:
+            tabs = st.tabs(["🏗️ Matriz & Cirugía (P7)", "📖 Glosario (P8)", "⚠️ Consultas (P0)"])
+
+            # --- TAB 1: MATRIZ Y CIRUGÍA ---
+            with tabs[0]:
+                st.subheader("Matriz Isomórfica Target")
+                
+                # Visualización HTML de Tokens
+                html_tokens = []
+                for i, slot in enumerate(sistema.mtx_t):
+                    bg = "#eee"
+                    if slot.status == Status.ASIGNADO: bg = "#d4edda" # Verde
+                    if slot.status == Status.BLOQUEADO: bg = "#f8d7da" # Rojo (Loc)
+                    if slot.status == Status.NULO: bg = "#ccc"; text_dec = "line-through"
+                    else: text_dec = "none"
+
+                    val = slot.render(sistema.modo_salida)
+                    tooltip = f"ID:{i} | SRC:{slot.token_src}"
+                    
+                    html_tokens.append(
+                        f"<div style='display:inline-block; background:{bg}; padding:2px 5px; "
+                        f"margin:2px; border:1px solid #ccc; border-radius:4px; "
+                        f"font-family:monospace; text-decoration:{text_dec}' title='{tooltip}'>"
+                        f"<small style='color:#666; font-size:0.6em'>{i}</small><br>"
+                        f"<b>{val}</b></div>"
+                    )
+                st.markdown("".join(html_tokens), unsafe_allow_html=True)
+
+                st.divider()
+                
+                # Herramientas
+                c_tools1, c_tools2 = st.columns(2)
+                
+                with c_tools1:
+                    with st.expander("🛠️ Crear Locución (P8.A)", expanded=False):
+                        l_start = st.number_input("ID Inicio", 0, len(sistema.mtx_s), key="ls")
+                        l_end = st.number_input("ID Fin", 0, len(sistema.mtx_s), key="le")
+                        l_txt = st.text_input("Traducción (A-B-C)")
+                        if st.button("Fusionar"):
+                            ok, msg = sistema.crear_locucion(l_start, l_end, l_txt)
+                            if ok: st.success(msg); st.rerun()
+                            else: st.error(msg)
+
+                with c_tools2:
+                    with st.expander("🔧 Reparación Sintáctica (P7)", expanded=False):
+                        r_id = st.number_input("Target ID", 0, len(sistema.mtx_s), key="rid")
+                        r_txt = st.text_input("Inyección", key="rin")
+                        cc1, cc2, cc3 = st.columns(3)
+                        if cc1.button("PRE"):
+                            sistema.inyectar_token(r_id, r_txt, "PRE"); st.rerun()
+                        if cc2.button("POST"):
+                            sistema.inyectar_token(r_id, r_txt, "POST"); st.rerun()
+                        if cc3.button("ANULAR"):
+                            sistema.alternar_nulidad(r_id); st.rerun()
+                        if st.button("Limpiar ID"):
+                             sistema.limpiar_inyecciones(r_id); st.rerun()
+
+            # --- TAB 2: GLOSARIO ---
+            with tabs[1]:
+                st.subheader("Editor de Núcleos")
+                
+                # Preparar datos para editor
+                data_glos = []
+                # Solo mostrar núcleos y partículas individuales (no locuciones completas ni puntuación)
+                for k, v in sistema.glosario.items():
+                    if v.categoria not in [Categoria.PUNTUACION, Categoria.LOCUCION]:
+                        data_glos.append({
+                            "Token Fuente": k,
+                            "Traducción": v.token_tgt,
+                            "Categoría": v.categoria.value,
+                            "Status": v.status.value
+                        })
+                
+                if data_glos:
+                    df = pd.DataFrame(data_glos)
+                    edited = st.data_editor(df, key="main_editor", use_container_width=True, disabled=["Token Fuente"])
+                    
+                    if st.button("GUARDAR Y RE-PROCESAR"):
+                        # Sincronizar cambios
+                        for i, row in edited.iterrows():
+                            key = row["Token Fuente"]
+                            new_tgt = row["Traducción"]
+                            if sistema.glosario[key].token_tgt != new_tgt:
+                                sistema.glosario[key].token_tgt = new_tgt
+                                sistema.glosario[key].status = Status.ASIGNADO
+                        
+                        sistema.ejecutar_core_p3()
+                        st.success("Matriz regenerada.")
+                        st.rerun()
+                else:
+                    st.info("Sin tokens pendientes.")
+
+            # --- TAB 3: SALIDA ---
+            with tabs[2]:
+                st.warning("Panel de Consultas (Demo)")
+                if sistema.consultas_pendientes:
+                    for c in sistema.consultas_pendientes:
+                        st.write(f"**{c.tipo.value}**: {c.contexto}")
+                else:
+                    st.success("Sin alertas activas.")
+
+    # --- FOOTER: EXPORTACIÓN ---
+    if st.session_state.fase == "TRABAJO":
+        st.markdown("---")
+        st.subheader("Salida Final")
+        final_txt = sistema.renderizar_texto_final()
+        st.code(final_txt)
+        st.download_button("Descargar .TXT", final_txt, "traduccion.txt")
+
+if __name__ == "__main__":
+    main()
