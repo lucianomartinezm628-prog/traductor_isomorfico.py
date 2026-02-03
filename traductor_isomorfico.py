@@ -6,34 +6,31 @@ from typing import List, Dict
 from enum import Enum
 import re
 import json
-import time
 
 # ==============================================================================
-# CONFIGURACIÓN Y ENUMS (Protocolo 1 & 2)
+# I. PROTOCOLOS 1 & 2: CONSTITUCIÓN Y DEFINICIONES
 # ==============================================================================
 
 class Categoria(Enum):
-    NUCLEO = "NUCLEO"
-    PARTICULA = "PARTICULA"
-    LOCUCION = "LOCUCION"
+    NUCLEO = "NUCLEO"       # Sustantivos, adjetivos, verbos
+    PARTICULA = "PARTICULA" # Preposiciones, conjunciones
+    LOCUCION = "LOCUCION"   # Unidades complejas A-B-C
     PUNTUACION = "PUNTUACION"
 
 class Status(Enum):
     PENDIENTE = "PENDIENTE"
     ASIGNADO = "ASIGNADO"
-    BLOQUEADO = "BLOQUEADO"
-    NULO = "NULO"
+    BLOQUEADO = "BLOQUEADO" # Token absorbido por locución
+    NULO = "NULO"           # Marcado con {...}
 
 class Origen(Enum):
     FUENTE = "FUENTE"
     IA = "IA_SUGERENCIA"
-
-# ==============================================================================
-# ESTRUCTURAS DE DATOS (Protocolo 1.B)
-# ==============================================================================
+    INYECCION = "INYECCION" # Marcado con [...]
 
 @dataclass
 class Slot:
+    """Representa una posición en la Matriz Isomórfica"""
     id: str
     pos_index: int
     token_src: str
@@ -45,9 +42,9 @@ class Slot:
     inyecciones_posteriores: List[str] = field(default_factory=list)
 
     def render(self, mode="BORRADOR"):
+        """Renderizado según Protocolo 10.B"""
         if self.status == Status.NULO: return f"{{{self.token_src}}}"
-        if self.status == Status.BLOQUEADO:
-             if not self.token_tgt: return "" 
+        if self.status == Status.BLOQUEADO and not self.token_tgt: return "" 
         
         nucleo = self.token_tgt if self.token_tgt else f"[{self.token_src}?]"
         if mode == "BORRADOR" and self.status == Status.PENDIENTE:
@@ -59,14 +56,14 @@ class Slot:
 
 @dataclass
 class EntradaGlosario:
+    """Registro del Glosario P8"""
     token_src: str
     token_tgt: str
     categoria: Categoria
     status: Status
-    etimologia_ia: str = "" 
 
 # ==============================================================================
-# SISTEMA CENTRAL (Protocolo 3, 8 & 6)
+# II. SISTEMA CENTRAL (LÓGICA P3, P7, P8)
 # ==============================================================================
 
 class SistemaTraduccion:
@@ -76,20 +73,24 @@ class SistemaTraduccion:
         self.glosario: Dict[str, EntradaGlosario] = {}
         self.modo_salida = "BORRADOR"
         self.api_key = ""
+        self.modelo_ia = "gemini-2.5-flash" 
 
     def _detectar_categoria(self, token: str) -> Categoria:
+        """Heurística inicial para P8.A"""
         if re.match(r"[^\w\s]", token): return Categoria.PUNTUACION
         particulas = {"el", "la", "de", "en", "y", "que", "a", "al", "wa", "fi", "min", "bi"}
         if token.lower() in particulas: return Categoria.PARTICULA
         return Categoria.NUCLEO
 
     def registrar_token(self, token_src, categoria):
+        """Registro obligatorio previo a traducción"""
         if token_src not in self.glosario:
             self.glosario[token_src] = EntradaGlosario(
                 token_src=token_src, token_tgt="", categoria=categoria, status=Status.PENDIENTE
             )
 
     def procesar_texto_input(self, texto_crudo: str):
+        """P10.A y P8.A: Preparación e Isomorfismo"""
         texto_limpio = texto_crudo.replace("\r", "")
         tokens_raw = re.findall(r"(\w+|[^\w\s])", texto_limpio)
         self.mtx_s = []; self.mtx_t = []
@@ -102,33 +103,26 @@ class SistemaTraduccion:
             self.mtx_t.append(Slot(id=f"T_{i}", pos_index=i, token_src=token))
 
     def consultar_ia_glosario(self):
-        if not self.api_key:
-            return False, "Falta API Key"
-
+        """P6: Asistencia de IA para Glosario"""
+        if not self.api_key: return False, "Falta API Key"
         pendientes = [k for k, v in self.glosario.items() 
                       if v.status == Status.PENDIENTE and v.categoria == Categoria.NUCLEO]
-        
-        if not pendientes:
-            return False, "No hay núcleos pendientes."
+        if not pendientes: return False, "No hay núcleos pendientes."
 
         try:
             genai.configure(api_key=self.api_key)
-            # ACTUALIZADO A GEMINI 2.0 FLASH (Estándar Feb 2026)
-            model = genai.GenerativeModel('gemini-2.0-flash')
+            model = genai.GenerativeModel(self.modelo_ia)
             
             prompt = f"""
-            Actúa como un traductor etimológico estricto (Protocolo Isomórfico).
-            Necesito la raíz/traducción literal en español para estos tokens.
-            
+            Actúa como un experto en filología y Protocolo de Traducción Isomórfica.
+            Proporciona la RAÍZ ETIMOLÓGICA literal en español para estos tokens.
             REGLAS:
-            1. Prioriza la etimología (raíz) sobre el uso técnico moderno.
-            2. Devuelve SOLO un objeto JSON.
-            3. Formato: {{"token": "traduccion"}}
-            
+            1. Máxima literalidad etimológica (Protocolo 4).
+            2. Formato JSON: {{"token": "traduccion"}}
             TOKENS: {json.dumps(pendientes)}
             """
             
-            with st.spinner("🤖 IA analizando raíces etimológicas..."):
+            with st.spinner(f"🤖 IA {self.modelo_ia} analizando raíces..."):
                 response = model.generate_content(prompt)
                 texto_resp = response.text.replace("```json", "").replace("```", "").strip()
                 diccionario_ia = json.loads(texto_resp)
@@ -139,22 +133,22 @@ class SistemaTraduccion:
                         self.glosario[k].token_tgt = v
                         self.glosario[k].status = Status.ASIGNADO
                         count += 1
-                return True, f"IA completó {count} definiciones."
-
+                return True, f"IA procesó {count} raíces correctamente."
         except Exception as e:
+            if "429" in str(e): return False, "⚠️ CUOTA AGOTADA: Google pide esperar. Reintenta en 15s."
             return False, f"Error IA: {str(e)}"
 
     def ejecutar_core_p3(self):
+        """Mapeo 1:1 entre Glosario y Matriz Target"""
         for i, slot_s in enumerate(self.mtx_s):
             slot_t = self.mtx_t[i]
-            if slot_t.status == Status.BLOQUEADO and (slot_t.categoria == Categoria.LOCUCION or not slot_t.token_tgt):
-                continue
+            if slot_t.status == Status.BLOQUEADO: continue
             
             token_key = slot_s.token_src.lower()
             entrada = self.glosario.get(token_key)
             if not entrada and slot_s.categoria == Categoria.PUNTUACION:
                  entrada = self.glosario.get(slot_s.token_src)
-
+                 
             if entrada and entrada.token_tgt:
                 slot_t.token_tgt = entrada.token_tgt
                 slot_t.status = Status.ASIGNADO
@@ -164,6 +158,7 @@ class SistemaTraduccion:
                     slot_t.status = Status.PENDIENTE
 
     def crear_locucion(self, start, end, texto):
+        """Protocolo 8.A: Fusión de tokens"""
         if not (0 <= start <= end < len(self.mtx_s)): return False, "Rango inválido"
         tokens = [self.mtx_s[i].token_src for i in range(start, end+1)]
         key = " ".join(tokens).lower()
@@ -175,60 +170,47 @@ class SistemaTraduccion:
         return True, f"Locución '{key}' creada."
 
     def renderizar_texto_final(self):
+        """P10.B: Serialización y limpieza"""
         buffer = []
         for slot in self.mtx_t:
             txt = slot.render(self.modo_salida)
             if not txt: continue
-            is_punct = slot.categoria == Categoria.PUNTUACION or txt in [",", ".", ";"]
+            is_punct = slot.categoria == Categoria.PUNTUACION or txt in [",", ".", ";", ":", "!", "?", "»"]
             if is_punct and buffer and buffer[-1] == " ": buffer.pop()
             buffer.append(txt)
-            if txt not in ["("]: buffer.append(" ")
+            if txt not in ["(", "¿", "¡", "«"]: buffer.append(" ")
         return "".join(buffer).strip()
 
 # ==============================================================================
-# UI (Streamlit)
+# III. INTERFAZ DE USUARIO (UI)
 # ==============================================================================
 
 def main():
-    st.set_page_config(layout="wide", page_title="SysTrad AI 2.0")
+    st.set_page_config(layout="wide", page_title="SysTrad 2.5 AI")
     if 'sistema' not in st.session_state: st.session_state.sistema = SistemaTraduccion()
     sys = st.session_state.sistema
 
     with st.sidebar:
-        st.title("⚙️ Configuración")
-        st.markdown("### 🧠 Cerebro IA")
+        st.title("⚙️ Sistema 2.5")
         api_key = st.text_input("Google API Key", type="password")
         if api_key: sys.api_key = api_key
-        
         sys.modo_salida = st.radio("Modo Visual", ["BORRADOR", "FINAL"])
-        
-        st.divider()
-        if st.button("🔍 Diagnóstico: Listar Modelos"):
-            if sys.api_key:
-                try:
-                    genai.configure(api_key=sys.api_key)
-                    models = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-                    st.write("Modelos disponibles en tu región:")
-                    st.code("\n".join(models))
-                except Exception as e: st.error(f"Error: {e}")
-            else: st.warning("Ingresa API Key primero.")
-
         if st.button("🗑️ REINICIAR"): st.session_state.clear(); st.rerun()
 
-    st.title("Traductor Isomórfico + IA 🤖")
+    st.title("Traducción Isomórfica + Gemini 2.5 🤖")
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        txt = st.text_area("Texto Fuente", height=200)
-        if st.button("1. PROCESAR TEXTO"):
+        txt = st.text_area("1. Texto Fuente", height=200, placeholder="Cargue aquí el original...")
+        if st.button("🚀 PROCESAR TEXTO"):
             sys.procesar_texto_input(txt)
             st.rerun()
 
     with c2:
-        tabs = st.tabs(["🏗️ Matriz", "📖 Glosario & IA", "📝 Salida"])
+        tabs = st.tabs(["🏗️ Matriz & Cirugía", "📖 Glosario & IA", "📝 Salida"])
         
         with tabs[0]:
-            # Renderizado Isomórfico (Protocolo 10)
+            # Matriz P10
             html = []
             for i, s in enumerate(sys.mtx_t):
                 color = "#d4edda" if s.status == Status.ASIGNADO else "#eee"
@@ -246,29 +228,25 @@ def main():
                 if st.button("Crear Locución"): sys.crear_locucion(ls, le, lt); st.rerun()
 
         with tabs[1]:
-            # Protocolo 6: IA
-            if st.button("🤖 AUTO-COMPLETAR CON IA (Gemini)", type="primary"):
+            # IA P6
+            if st.button("🤖 AUTO-COMPLETAR (Gemini 2.5)", type="primary"):
                 ok, msg = sys.consultar_ia_glosario()
-                if ok: 
-                    sys.ejecutar_core_p3()
-                    st.success(msg)
-                    st.rerun()
+                if ok: sys.ejecutar_core_p3(); st.success(msg); st.rerun()
                 else: st.error(msg)
             
-            # Protocolo 8: Editor de Glosario
-            data = [{"Token": k, "Traducción": v.token_tgt, "Categoría": v.categoria.value} 
+            # Editor Glosario P8
+            data = [{"Token": k, "Traducción": v.token_tgt} 
                     for k,v in sys.glosario.items() if v.categoria != Categoria.PUNTUACION]
             if data:
                 edited = st.data_editor(pd.DataFrame(data), key="editor", disabled=["Token"], use_container_width=True)
-                if st.button("💾 GUARDAR CAMBIOS"):
+                if st.button("💾 GUARDAR"):
                     for i, row in edited.iterrows():
                         sys.glosario[row["Token"]].token_tgt = row["Traducción"]
                         sys.glosario[row["Token"]].status = Status.ASIGNADO
-                    sys.ejecutar_core_p3()
-                    st.rerun()
+                    sys.ejecutar_core_p3(); st.rerun()
 
         with tabs[2]:
-            st.text_area("Texto Isomórfico Final", value=sys.renderizar_texto_final(), height=300)
+            st.text_area("Resultado Final", value=sys.renderizar_texto_final(), height=300)
 
 if __name__ == "__main__":
     main()
