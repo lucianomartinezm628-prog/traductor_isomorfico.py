@@ -9,7 +9,7 @@ import json
 import time
 
 # ==============================================================================
-# CONFIGURACIÓN Y ENUMS
+# CONFIGURACIÓN Y ENUMS (Protocolo 1 & 2)
 # ==============================================================================
 
 class Categoria(Enum):
@@ -29,7 +29,7 @@ class Origen(Enum):
     IA = "IA_SUGERENCIA"
 
 # ==============================================================================
-# ESTRUCTURAS DE DATOS
+# ESTRUCTURAS DE DATOS (Protocolo 1.B)
 # ==============================================================================
 
 @dataclass
@@ -66,7 +66,7 @@ class EntradaGlosario:
     etimologia_ia: str = "" 
 
 # ==============================================================================
-# SISTEMA CENTRAL (CON CEREBRO IA)
+# SISTEMA CENTRAL (Protocolo 3, 8 & 6)
 # ==============================================================================
 
 class SistemaTraduccion:
@@ -113,25 +113,24 @@ class SistemaTraduccion:
 
         try:
             genai.configure(api_key=self.api_key)
-            # SE ACTUALIZA A GEMINI-1.5-FLASH PARA EVITAR ERROR 404
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            # ACTUALIZADO A GEMINI 2.0 FLASH (Estándar Feb 2026)
+            model = genai.GenerativeModel('gemini-2.0-flash')
             
             prompt = f"""
             Actúa como un traductor etimológico estricto (Protocolo Isomórfico).
-            Tengo una lista de tokens fuente. Necesito su raíz/traducción literal en español.
+            Necesito la raíz/traducción literal en español para estos tokens.
             
             REGLAS:
-            1. Prioriza la etimología sobre el uso técnico moderno.
-            2. Devuelve SOLO un objeto JSON válido.
-            3. Formato: {{"token_fuente": "traduccion_literal"}}
+            1. Prioriza la etimología (raíz) sobre el uso técnico moderno.
+            2. Devuelve SOLO un objeto JSON.
+            3. Formato: {{"token": "traduccion"}}
             
-            TOKENS A TRADUCIR:
-            {json.dumps(pendientes)}
+            TOKENS: {json.dumps(pendientes)}
             """
             
-            with st.spinner(f"Consultando raíces etimológicas para {len(pendientes)} tokens..."):
+            with st.spinner("🤖 IA analizando raíces etimológicas..."):
                 response = model.generate_content(prompt)
-                texto_resp = response.text.replace("```json", "").replace("```", "")
+                texto_resp = response.text.replace("```json", "").replace("```", "").strip()
                 diccionario_ia = json.loads(texto_resp)
                 
                 count = 0
@@ -139,9 +138,7 @@ class SistemaTraduccion:
                     if k in self.glosario:
                         self.glosario[k].token_tgt = v
                         self.glosario[k].status = Status.ASIGNADO
-                        self.glosario[k].etimologia_ia = "Sugerido por Gemini"
                         count += 1
-                
                 return True, f"IA completó {count} definiciones."
 
         except Exception as e:
@@ -189,8 +186,9 @@ class SistemaTraduccion:
         return "".join(buffer).strip()
 
 # ==============================================================================
-# UI
+# UI (Streamlit)
 # ==============================================================================
+
 def main():
     st.set_page_config(layout="wide", page_title="SysTrad AI 2.0")
     if 'sistema' not in st.session_state: st.session_state.sistema = SistemaTraduccion()
@@ -198,32 +196,45 @@ def main():
 
     with st.sidebar:
         st.title("⚙️ Configuración")
-        st.markdown("### 🧠 Cerebro IA (Gemini)")
+        st.markdown("### 🧠 Cerebro IA")
         api_key = st.text_input("Google API Key", type="password")
         if api_key: sys.api_key = api_key
         
         sys.modo_salida = st.radio("Modo Visual", ["BORRADOR", "FINAL"])
-        if st.button("REINICIAR"): st.session_state.clear(); st.rerun()
+        
+        st.divider()
+        if st.button("🔍 Diagnóstico: Listar Modelos"):
+            if sys.api_key:
+                try:
+                    genai.configure(api_key=sys.api_key)
+                    models = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+                    st.write("Modelos disponibles en tu región:")
+                    st.code("\n".join(models))
+                except Exception as e: st.error(f"Error: {e}")
+            else: st.warning("Ingresa API Key primero.")
+
+        if st.button("🗑️ REINICIAR"): st.session_state.clear(); st.rerun()
 
     st.title("Traductor Isomórfico + IA 🤖")
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        txt = st.text_area("Texto Fuente", height=150)
-        if st.button("PROCESAR TEXTO"):
+        txt = st.text_area("Texto Fuente", height=200)
+        if st.button("1. PROCESAR TEXTO"):
             sys.procesar_texto_input(txt)
             st.rerun()
 
     with c2:
-        tabs = st.tabs(["Matriz", "Glosario (IA)", "Salida"])
+        tabs = st.tabs(["🏗️ Matriz", "📖 Glosario & IA", "📝 Salida"])
         
         with tabs[0]:
+            # Renderizado Isomórfico (Protocolo 10)
             html = []
             for i, s in enumerate(sys.mtx_t):
                 color = "#d4edda" if s.status == Status.ASIGNADO else "#eee"
                 if s.status == Status.NULO: color = "#ccc"
                 val = s.render(sys.modo_salida)
-                html.append(f"<div style='background:{color};display:inline-block;padding:2px;margin:2px;border-radius:4px;font-family:monospace' title='ID {i}'>{val}<sub style='color:#555'>{i}</sub></div>")
+                html.append(f"<div style='background:{color};display:inline-block;padding:3px;margin:2px;border-radius:4px;font-family:monospace' title='ID {i}'>{val}<sub style='color:#555;font-size:0.7em'>{i}</sub></div>")
             st.markdown("".join(html), unsafe_allow_html=True)
             
             st.divider()
@@ -231,12 +242,12 @@ def main():
                 cc1, cc2, cc3 = st.columns(3)
                 ls = cc1.number_input("Loc Inicio", 0, value=0)
                 le = cc2.number_input("Loc Fin", 0, value=0)
-                lt = cc3.text_input("Locución Txt")
+                lt = cc3.text_input("Traducción Loc")
                 if st.button("Crear Locución"): sys.crear_locucion(ls, le, lt); st.rerun()
 
         with tabs[1]:
-            st.info("Paso 1: Ingresa tu API Key en la barra lateral.")
-            if st.button("🤖 AUTO-COMPLETAR GLOSARIO (GEMINI)", type="primary"):
+            # Protocolo 6: IA
+            if st.button("🤖 AUTO-COMPLETAR CON IA (Gemini)", type="primary"):
                 ok, msg = sys.consultar_ia_glosario()
                 if ok: 
                     sys.ejecutar_core_p3()
@@ -244,11 +255,12 @@ def main():
                     st.rerun()
                 else: st.error(msg)
             
-            data = [{"Token": k, "Traducción": v.token_tgt, "Status": v.status.value} 
-                    for k,v in sys.glosario.items() if v.categoria == Categoria.NUCLEO]
+            # Protocolo 8: Editor de Glosario
+            data = [{"Token": k, "Traducción": v.token_tgt, "Categoría": v.categoria.value} 
+                    for k,v in sys.glosario.items() if v.categoria != Categoria.PUNTUACION]
             if data:
                 edited = st.data_editor(pd.DataFrame(data), key="editor", disabled=["Token"], use_container_width=True)
-                if st.button("GUARDAR MANUAL"):
+                if st.button("💾 GUARDAR CAMBIOS"):
                     for i, row in edited.iterrows():
                         sys.glosario[row["Token"]].token_tgt = row["Traducción"]
                         sys.glosario[row["Token"]].status = Status.ASIGNADO
@@ -256,7 +268,7 @@ def main():
                     st.rerun()
 
         with tabs[2]:
-            st.code(sys.renderizar_texto_final())
+            st.text_area("Texto Isomórfico Final", value=sys.renderizar_texto_final(), height=300)
 
 if __name__ == "__main__":
     main()
